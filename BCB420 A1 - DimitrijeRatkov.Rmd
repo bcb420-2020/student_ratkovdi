@@ -1,0 +1,262 @@
+---
+title: "BCB420 Assignment 1 - Data Prep"
+output:
+  html_document:
+    df_print: paged
+---
+
+First, of course, we install necessary modules.
+
+Before anything else, I took time to thoroughly read the paper. I also started writing up the data interpretation section, as the first few points could be answered right after reading the paper.
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("GEOquery")
+BiocManager::install("biomaRt")
+BiocManager::install("edgeR")
+library(edgeR)
+library(biomaRt)
+```
+
+A promising dataset was found very quickly, from a study investigating downstream cellular effectors of the lytic reactivation process of Epstein Barr virus (EBV). As I have a strong focus on virology, and I wanted to apply that background here, finding an appropriate dataset was as easy as searching for a topic I was already aware of. I had already worked with EBV during my second-year research. The latent-lytic reactivation pathway, dealing with how this latent virus starts an active infection anew (renewing the viral replication process) when conditions are right, is a big topic in EBV research, and bioinformatics approaches are well-suited to address it.
+
+This group chose to examine gene expression in stimulated and non-stimulated cells across three timepoints - 3h, 24h, and 48h - corresponding to a time before viral genes are expressed but a reactivation phenotype is evident, a time when the virus would be in the lytic mode transcribing early-mid proteins, and a time when cell functions are being shut down to maximize viral production. The HH514-16 cell line was used, representing a lymphocyte lineage from a case of EBV-induced Burkitt's lymphoma. Cells were reactivated using a sodium butyrate signal.
+
+The experiment was done using the Bru-seq protocol; pulling down RNAs using a bromouridine label, constructing a cDNA library, and sequencing on an Illumina HiSeq 2500.
+
+More information on this paper can be found on the corresponding articles on my student wiki. 
+
+------------------------
+
+The initial coverage of the dataset was decent, spanning over 57000 genes across all chromosomes, and also describing viral genes (though we will not be ad). Specifics of coverage will be addressed when the data has been analyzed more thoroughly. The research is new, and the dataset was updated as recently as Jan 15th. Two replicates of the controls and experimental samples were used, which are not as many replicates as would be ideal, but should suffice.
+
+In this case, the raw data is stored in the supplemental documents of the sample entries. It is also accessible through the main series' supplemental docs, but going through the samples is simpler since we're only dealing with one supp. doc. at a time, instead of unzipping and going file-by-file. As such we will access it there.
+
+```{r}
+# Save series metadata
+series <- unlist(GEOquery::getGEO("GSE141220"))
+
+# Extract sample and file names for automated data processing
+sampleFileNames <- unlist(strsplit(series$GSE141220_series_matrix.txt.gz@experimentData@other$sample_id, split="\\s"))
+sampleNames <- as.vector(series$GSE141220_series_matrix.txt.gz@phenoData@data$title)
+
+# Initialize an empty list-of-lists to collect the sample data into, once all of it has been gathered
+rawCounts <- vector("list", 12)
+for (s in sampleFileNames)
+{
+  # We download if the sample file in the corresponding sample subdir doesn't exist.
+  if (!file.exists(paste(s, "/", "sample.rds", sep = "")))
+  {
+    sfile <- GEOquery::getGEOSuppFiles(s, makeDirectory = TRUE)
+    fname <- rownames(sfile)
+    b <- read.delim(fname[1], header = TRUE)
+    rawCounts[[match(s, sampleFileNames)]] <- b
+    saveRDS(b, file = paste(s, "/", "sample.rds", sep = ""))
+  }
+  # Otherwise we load the saved file.
+  else
+  {
+    b <- readRDS(file = paste(s, "/", "sample.rds", sep = ""))
+    rawCounts[[match(s, sampleFileNames)]] <- readRDS(file = paste(s, "/", "sample.rds", sep = ""))
+  }
+}
+names(rawCounts) <- sampleNames
+```
+
+We've now loaded each sample's raw data into of data frames, which are stored in a central list. We will parse this into a ain data
+
+```{r}
+# Start the central data frame, which will gather the raw counts of all the samples; match to genes.
+counts <- data.frame(ensemblID = rawCounts[[1]]$ensembl_gene, gname = rawCounts[[1]]$name, eff_len = rawCounts[[1]]$effective_length)
+
+# To be able to iteratively add to this data frame, we initialize it with a single column of the appropriate length.
+reads <- data.frame(seed = rep(NA, times = 57733))
+for(s in rawCounts)
+{
+  newCol <- data.frame(ree = s$read_count)
+  reads <- cbind(reads, newCol)
+}
+# After iterating, we delete this column.
+reads$seed <- NULL
+# Assign sample names to their corresponding columns and continue.
+colnames(reads) <- sampleNames
+counts <- cbind(counts, reads)
+```
+
+We are about to filter out low-value genes. Let's check how much of our data will be pruned.
+
+```{r}
+# Save current size of data set
+oldsize <- length(counts$ensemblID)
+
+cpms = edgeR::cpm(counts[,4:15])
+rownames(cpms) <- counts[,1]
+
+# We have two replicates for each condition.
+keep = rowSums(cpms >1) >=2
+counts_filtered <- counts[keep,]
+
+# Now check the new size.
+newsize <- length(counts_filtered$ensemblID)
+
+summarized_counts <- sort(table(counts_filtered$ensemblID),decreasing = TRUE)
+
+print("Initial genes in consideration:")
+print(oldsize)
+print("Genes after filtering:")
+print(newsize)
+```
+
+By calling the above size variables, we can see that we've reduced the number of genes under consideration from 57733 to 20503. By calling the summarized counts table, we see that there are no duplicate counts.
+
+Now we must normalize the data. Normalization was performed using the TMM method, as the data was in the form of an RNAseq.
+
+Below, normalization of the data, and visualizations before and after that process, can be seen. The "outliers" at negative infinity, throwing warning messages below, are not factually outliers - rather the log2 of 0 is recognized as negative infinity in R.
+
+```{r}
+# To visually examine our data before normalization, we make some box plots.
+dataBefore <- log2(cpm(counts_filtered[,4:15]))
+boxplot(dataBefore, xlab = "Samples", ylab = "log2 CPM", 
+        las = 2, cex = 0.5, cex.lab = 0.5,
+        cex.axis = 0.5, main = "EBV Reac. RNAseq")
+abline(h = median(apply(dataBefore, 2, median)), col = "red", lwd = 0.6, lty = "dashed")
+
+filtered_data_matrix <- as.matrix(counts_filtered[,4:15])
+rownames(filtered_data_matrix) <- counts_filtered$ensemblID
+
+# The samples are grouped replicate 1,2 for each of six conditions.
+samples = rep(1:6, each=2)
+d = edgeR::DGEList(counts=filtered_data_matrix, group=samples)
+
+d = calcNormFactors(d)
+normalized <- cpm(d)
+counts_normalized <- cbind(data.frame(counts_filtered[,1:3]), as.data.frame(normalized))
+
+# ...and another one after normalization.
+dataAfter <- log2(cpm(counts_normalized[,4:15]))
+boxplot(dataAfter, xlab = "Samples", ylab = "log2 CPM", 
+        las = 2, cex = 0.5, cex.lab = 0.5,
+        cex.axis = 0.5, main = "EBV Reac. RNAseq Nrmlzd")
+abline(h = median(apply(dataAfter, 2, median)), col = "green", lwd = 0.6, lty = "dashed")
+```
+
+There is no clear difference between the plots. As the values in the filtered vs. neutralized counts have changed, we assume that the normalization was successful and the data was high-quality to begin with.
+
+Now, we're finally ready to map to symbols. We will pull from biomaRt, and attempt to maximize the coverage of our dataset using the proper HUGO symbols.
+
+```{r}
+# Save on computation and bandwidth by saving / reading from a file when possible.
+conversion_stash <- "ebv_id_conversion.rds"
+ensembl <- useEnsembl("ENSEMBL_MART_ENSEMBL", dataset="hsapiens_gene_ensembl", mirror = "useast")
+if(file.exists(conversion_stash)) {
+    HUGOs <- readRDS(conversion_stash)
+} else {
+  HUGOs <- getBM(attributes = c("ensembl_gene_id_version","hgnc_symbol"), filters = c("ensembl_gene_id_version"), values = counts_normalized$ensemblID, ensembl, useCache = FALSE)
+    saveRDS(HUGOs, conversion_stash)
+}
+```
+
+
+We're not out of the woods yet. There are many blank symbols in our HUGOs frame to begin with: we can see this by ranking the occurence of IDs. 
+
+```{r}
+summarized_hgnc_counts <- sort(table(HUGOs$hgnc_symbol),decreasing = TRUE)
+
+print(summarized_hgnc_counts[1:10])
+```
+
+We see 2889 occurences of a blank space (this is a blank space, not a whitespace character). After this, ITFG2-AS1 and POLR2J4 appear with two occurences in the frame. Lastly come the typical unique symbols.
+
+We remove all rows with blank symbols. Later we will collapse the duplicates, which were confirmed to map to the same gene: the two ITFG2-AS1 entries correspond to two variants of the ITFG2 antisense RNA, and the two POLR2J4 entries correspond to an untranscribed LncRNA product. The counts for the shorter variants will be collapsed into the larger ones.
+
+```{r}
+HUGOs <- HUGOs[HUGOs$hgnc_symbol != "", 1:2]
+```
+
+
+After much effort, a merging of the pulled Mart attribute frame with the normalized counts was successful. 
+
+```{r}
+colnames(HUGOs) <- c("ensemblID", "hgnc_symbol")
+counts_normal_annot <- merge.data.frame(HUGOs, counts_normalized, by.x = 1, all.y=TRUE)
+
+```
+
+It's not clear why so many blank symbols appeared in the biomaRt pull. There may be a temporary issue with the backend servers. There may be an issue with the initial annotation of this data set. 
+In any case, we move on. Now we collapse:
+
+```{r}
+for (i in c(4:15))
+{
+  #collapse ITFG2-AS1 reads
+  counts_normal_annot[counts_normal_annot$ensemblID == "ENSG00000256150.2", i] = counts_normal_annot[counts_normal_annot$ensemblID == "ENSG00000256150.2", i] + counts_normal_annot[counts_normal_annot$ensemblID == "ENSG00000258325.2", i]
+  
+  # Collapse POLR2J4 reads
+  counts_normal_annot[counts_normal_annot$ensemblID == "ENSG00000214783.9", i] = counts_normal_annot[counts_normal_annot$ensemblID == "ENSG00000214783.9", i] + counts_normal_annot[counts_normal_annot$ensemblID == "ENSG00000272655.2", i]
+}
+
+# Remove the redundant entry.
+counts_normal_annot <- counts_normal_annot[(counts_normal_annot$ensemblID != "ENSG00000258325.2" & counts_normal_annot$ensemblID != "ENSG00000272655.2"),]
+```
+
+Finally, we will create a dataframe containing every protein with a known HGNC symbol, with that symbol acting as the rowname. Where possible, we set down the HUGO symbols as row-names for this frame, and the ensemblIDs for the other.
+
+```{r}
+# If we find an hgnc symbol, we split into this DF.
+counts_final_HUGO <- counts_normal_annot[!is.na(counts_normal_annot$hgnc_symbol),]
+rownames(counts_final_HUGO) <- counts_final_HUGO$hgnc_symbol
+
+# If not, we split into this one. We exclude the useless hgnc_symbol column from this.
+counts_final_old <- counts_normal_annot[is.na(counts_normal_annot$hgnc_symbol),-c(2)]
+rownames(counts_final_old) <- counts_final_old$ensemblID
+```
+
+For later analysis, if we need a non-ensemblID unique identifier, we can construct and assign unique names based on the gname column of the old mapping. For now, uniqueness is maintained by assigning ensemblIDs as row names.
+
+------------------------
+
+** What are the control and test conditions of the dataset? **
+
+The experiment was done in the HH514-16 cell line, which are lymphocytes from a case of EBV-induced Burkitt's lymphoma. The control conditions are untreated cells of this cell line. The test condition is an application of the lytic signal sodium butyrate (NaB), which induces cells latently infected with EBV to undergo lytic reactivation. The treatment conditions were applied for three different durations - 3h, 24h and 48h - across two replicates each.
+
+
+** Why is the dataset of interest to you? **
+
+The dataset is of interest because this system is familiar to me, and because it's addressing a question I've explored in the past, helping us achieve a comprehensive understanding. Furthermore, there's a practical application for this information. Epstein-Barr is a very common infection - by most estimates over 90% of adults worldwide are infected - that wreaks havoc on immunosuppressed patients. 
+
+Notably, organ transplant recipients are prone to transplant failure and secondary infections if they are given an organ from a donor who has latent EBV - these patients are put on immunosuppressive therapies to protect the transplant from immune attack, which means that reactivated virus has an easier time spreading, which in turn reactivates the immunity and causes further damage to host and transplant tissues. Understanding the lytic reactivation process is the first step in creating treatments to suppress viral spread and pathogenesis in these patients. In healthy patients, EBV transforms B cells, causing lymphoma; the latent phase is responsible for this, but lytic reactivation allows for the latently-infected population to expand, increasing the chances of that event. Lytic reactivation is also necessary for the spread of the virus between hosts.
+
+In patients, as in the lab, not every cell is infected simultaneously. Rather, a subpopulation of cells is susceptible to reactivation at any given time. The BZLF1 viral gene, and its ZEBRA protein product, are well-known to mediate reactivation; but a host of cellular proteins have been identified as interactors with this protein. In fact, reactivation is impossible without the presence of certain pro-lytic genes, which must be actively expressed in the cell for this to happen. This suggests a pro-lytic state exists, which facilitates the function of viral proteins and allows for the program of viral replication to restart. This state has not been characterized in great detail, nor is its temporal evolution apparent yet. This study aims to resolve those problems from a bioinformatics perspective.
+
+
+** Were there expression values that were not unique for specific genes? How did you handle these? **
+
+The most common instance of this were genes which had zero reads across all samples. These were filtered out using the CPM method. Otherwise, no attempt was made to handle such a situation. Theoretically the wrong reads could have been duplicated across gene entries, but this was deemed too difficult to address and likely to be a nonissue.
+
+
+** Were there expression values that could not be mapped to current HUGO symbols? **
+
+There were many. Out of the initial biomaRt pull, almost 3000 ensemblIDs lacked a HUGO symbol. Furthermore, many ensembleIDs weren't represented in the biomaRt pull at all. Such missing values were mapped to ensemblIDs instead, for the time being. I will follow up regarding the best avenue to deal with this in the future.
+
+
+** How many outliers were removed? **
+
+None. Without better understanding of how genes are upregulated or downregulated over the course of EBV infection, calling a result an "outlier" has no certain basis in fact. Manually pruning suspicious results would represent a type of investigator bias; additionally, there are outlier-proofed data analysis methods (for instance edgeR apparently has some good ones) which look at the problem from the statistical side, without the need for value judgements. 
+
+While these do not necessarily qualify as outliers, 37230 small-impact genes were initially removed from consideration.
+
+
+** How did you handle replicates? **
+
+Experimental replicates were represented using individual columns in the data frame.
+
+If duplicate symbol entries are meant by "replicates", these were dealt with by collapsing into the less spliced / larger / more representative gene product. In my case, these were untranslated RNAs, so this is likely an adequate method. A possible loss of resolution for these two proteins was deemed an acceptable loss for maintaining the cardinality of the data.
+
+
+** What is the final coverage of your dataset? **
+
+The final coverage of the HUGO-mapped dataset is 4675 genes; an additional 15827 are included if we consider the old mapping. All things considered this seems like a very small coverage for an RNAseq experiment, but not certainly useless; also, I don't know what type of numbers are expected after the workflow has been processed and whatnot.
+
+
